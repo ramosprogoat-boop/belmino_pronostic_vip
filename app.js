@@ -2,7 +2,11 @@ const SUPABASE_URL = 'https://zmoztqqjhanugypctfom.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_vf0S1GMe8-O9P7QZjuWzhQ_lysBucX9';
 
 const USE_SUPABASE = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
-let supabase = null;
+let sbClient = null;
+
+function isSupabaseReady() {
+  return Boolean(USE_SUPABASE && sbClient);
+}
 
 const STORAGE_KEYS = {
   USERS: 'belmino_users_v1',
@@ -111,72 +115,81 @@ function mapAnalysisRow(row) {
   };
 }
 
-async function initBackend() {
-  if (USE_SUPABASE) {
-    const { createClient } = await import('https://esm.sh/@supabase/supabase-js@2');
-    supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+function initBackend() {
+  try {
+    if (USE_SUPABASE && window.supabase && typeof window.supabase.createClient === 'function') {
+      sbClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    }
+  } catch (err) {
+    console.error('Erreur initialisation Supabase:', err);
   }
 }
 
 async function refreshData() {
-  if (!USE_SUPABASE) {
-    state.users = JSON.parse(localStorage.getItem(STORAGE_KEYS.USERS) || '[]');
-    state.matches = JSON.parse(localStorage.getItem(STORAGE_KEYS.MATCHES) || '[]');
-    state.analyses = JSON.parse(localStorage.getItem(STORAGE_KEYS.ANALYSES) || '[]');
-    const sessionId = localStorage.getItem(STORAGE_KEYS.SESSION);
-    state.currentUser = state.users.find((u) => u.id === sessionId) || null;
-    return;
-  }
+  try {
+    if (!USE_SUPABASE) {
+      state.users = JSON.parse(localStorage.getItem(STORAGE_KEYS.USERS) || '[]');
+      state.matches = JSON.parse(localStorage.getItem(STORAGE_KEYS.MATCHES) || '[]');
+      state.analyses = JSON.parse(localStorage.getItem(STORAGE_KEYS.ANALYSES) || '[]');
+      const sessionId = localStorage.getItem(STORAGE_KEYS.SESSION);
+      state.currentUser = state.users.find((u) => u.id === sessionId) || null;
+      return;
+    }
 
-  const { data: sessionData } = await supabase.auth.getSession();
-  const authUser = sessionData?.session?.user || null;
+    if (!sbClient) return;
 
-  if (authUser) {
-    const { data: profile } = await supabase
-      .from('profiles')
+    const { data: sessionData } = await sbClient.auth.getSession();
+    const authUser = sessionData?.session?.user || null;
+
+    if (authUser) {
+      const { data: profile } = await sbClient
+        .from('profiles')
+        .select('*')
+        .eq('id', authUser.id)
+        .single();
+
+      state.currentUser = profile
+        ? {
+            id: profile.id,
+            email: profile.email,
+            fullName: profile.full_name,
+            role: profile.role,
+            vipExpiresAt: profile.vip_expires_at
+          }
+        : null;
+    } else {
+      state.currentUser = null;
+    }
+
+    const { data: matchesRows } = await sbClient
+      .from('matches')
       .select('*')
-      .eq('id', authUser.id)
-      .single();
+      .order('kickoff_at', { ascending: true });
+    state.matches = (matchesRows || []).map(mapMatchRow);
 
-    state.currentUser = profile
-      ? {
-          id: profile.id,
-          email: profile.email,
-          fullName: profile.full_name,
-          role: profile.role,
-          vipExpiresAt: profile.vip_expires_at
-        }
-      : null;
-  } else {
-    state.currentUser = null;
-  }
-
-  const { data: matchesRows } = await supabase
-    .from('matches')
-    .select('*')
-    .order('kickoff_at', { ascending: true });
-  state.matches = (matchesRows || []).map(mapMatchRow);
-
-  const { data: analysesRows } = await supabase
-    .from('analyses')
-    .select('*')
-    .order('created_at', { ascending: false });
-  state.analyses = (analysesRows || []).map(mapAnalysisRow);
-
-  if (state.currentUser?.role === 'admin') {
-    const { data: profilesRows } = await supabase
-      .from('profiles')
+    const { data: analysesRows } = await sbClient
+      .from('analyses')
       .select('*')
       .order('created_at', { ascending: false });
-    state.users = (profilesRows || []).map((p) => ({
-      id: p.id,
-      email: p.email,
-      fullName: p.full_name,
-      role: p.role,
-      vipExpiresAt: p.vip_expires_at
-    }));
-  } else {
-    state.users = [];
+    state.analyses = (analysesRows || []).map(mapAnalysisRow);
+
+    if (state.currentUser?.role === 'admin') {
+      const { data: profilesRows } = await sbClient
+        .from('profiles')
+        .select('*')
+        .order('created_at', { ascending: false });
+      state.users = (profilesRows || []).map((p) => ({
+        id: p.id,
+        email: p.email,
+        fullName: p.full_name,
+        role: p.role,
+        vipExpiresAt: p.vip_expires_at
+      }));
+    } else {
+      state.users = [];
+    }
+  } catch (err) {
+    console.error('Erreur chargement données:', err);
   }
 }
 
@@ -516,10 +529,10 @@ window.openAnalysisModal = (analysisId) => {
 window.goAccount = () => navigateTo('account');
 
 window.adminSetOutcome = async (id, outcome) => {
-  if (USE_SUPABASE) {
-    await supabase.from('analyses').update({ outcome }).eq('id', id);
+  if (isSupabaseReady()) {
+    await sbClient.from('analyses').update({ outcome }).eq('id', id);
     await refreshData();
-  } else {
+  } else if (!USE_SUPABASE) {
     const item = state.analyses.find((a) => a.id === id);
     if (item) item.outcome = outcome;
     saveLocalStore();
@@ -530,10 +543,4 @@ window.adminSetOutcome = async (id, outcome) => {
 window.adminEditAnalysis = (id) => {
   const item = state.analyses.find((a) => a.id === id);
   if (!item) return;
-  document.getElementById('aEditId').value = item.id;
-  document.getElementById('aMatchId').value = item.matchId;
-  document.getElementById('aTitle').value = item.title;
-  document.getElementById('aPrediction').value = item.predictionLabel;
-  document.getElementById('aConfidence').value = item.confidence;
-  document.getElementById('aIsVip').value = String(item.isVip);
-  document.getElementById('aText').value = item.analysisTe
+  document.getElem
